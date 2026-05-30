@@ -1,0 +1,61 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        architecture: 'x64'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt6 Pillow numpy pyusb pyinstaller
+
+    - name: Build EXE with PyInstaller
+      run: |
+        pyinstaller `
+          --name="L805_DTF_RIP" `
+          --onefile `
+          --windowed `
+          --clean `
+          --paths=src `
+          --hidden-import=PyQt6.QtCore `
+          --hidden-import=PyQt6.QtGui `
+          --hidden-import=PyQt6.QtWidgets `
+          --hidden-import=PIL.Image `
+          --hidden-import=PIL.ImageFilter `
+          --hidden-import=numpy `
+          --hidden-import=usb `
+          --hidden-import=usb.core `
+          --hidden-import=usb.util `
+          --hidden-import=usb.backend.libusb1 `
+          --exclude-module=tkinter `
+          --exclude-module=matplotlib `
+          src/main.py
+
+    - name: Upload EXE artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: L805_DTF_RIP_Windows
+        path: dist/L805_DTF_RIP.exe
+        retention-days: 30
+
+    - name: Create Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: dist/L805_DTF_RIP.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
