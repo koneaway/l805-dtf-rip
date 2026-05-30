@@ -1,8 +1,8 @@
 """
-Epson L805 DTF RIP Engine — Main GUI
-Professional DTF RIP interface with drag-and-drop, preview toggle, Windows title bar
+Epson L805 DTF RIP Engine
+One-click print: RIP + USB transfer in single pipeline
 """
-import sys, os, threading
+import sys, os, datetime
 from pathlib import Path
 from PIL import Image
 
@@ -10,18 +10,13 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QSlider, QComboBox, QCheckBox,
     QGroupBox, QFileDialog, QProgressBar, QTextEdit, QSplitter,
-    QFrame, QScrollArea, QStatusBar, QMessageBox, QTabWidget,
-    QSpinBox, QSizePolicy, QToolBar, QMenuBar, QMenu, QListWidget,
-    QListWidgetItem, QStackedWidget, QButtonGroup, QRadioButton,
-    QAbstractItemView
+    QFrame, QStatusBar, QMessageBox, QTabWidget, QSpinBox,
+    QSizePolicy, QToolBar, QListWidget, QListWidgetItem,
+    QAbstractItemView, QMenu
 )
-from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QSize, QMimeData, QUrl, QPoint
-)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QPoint, QUrl
 from PyQt6.QtGui import (
-    QPixmap, QImage, QPainter, QColor, QFont, QIcon, QAction,
-    QDragEnterEvent, QDropEvent, QKeySequence, QPalette, QBrush,
-    QLinearGradient, QFontDatabase
+    QPixmap, QImage, QAction, QKeySequence, QDragEnterEvent, QDropEvent
 )
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -29,126 +24,112 @@ from rip_engine import RIPCompiler, RIPConfig, PrintMode, DPIMode
 from usb_comm import L805Printer, PrinterStatus
 
 
-# ── Workers ────────────────────────────────────────────────────────────────
+# ── Print Pipeline Worker ──────────────────────────────────────────────────
+# RIP + USB transfer in a single thread, just like real RIP software.
+# User clicks Print → everything happens automatically.
 
-class RIPWorker(QThread):
-    progress = pyqtSignal(int, str)
+class PrintPipelineWorker(QThread):
+    progress = pyqtSignal(int, str)   # pct, message
     log_msg  = pyqtSignal(str)
-    finished = pyqtSignal(bytes)
-    error    = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)  # success, message
 
-    def __init__(self, image, config):
+    def __init__(self, image: Image.Image, config: RIPConfig,
+                 printer: L805Printer):
         super().__init__()
-        self.image  = image
-        self.config = config
+        self.image   = image
+        self.config  = config
+        self.printer = printer
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+        self.printer.cancel()
 
     def run(self):
         try:
-            c = RIPCompiler(self.config,
-                            progress_cb=lambda p,m: self.progress.emit(p,m),
-                            log_cb=lambda m: self.log_msg.emit(m))
-            self.finished.emit(c.compile(self.image))
+            # ── Phase 1: RIP (0–70%) ──────────────────────────────────────
+            self.log_msg.emit("── 開始 RIP 編譯 ──")
+            compiler = RIPCompiler(
+                self.config,
+                progress_cb=lambda p, m: self.progress.emit(int(p * 0.7), m),
+                log_cb=lambda m: self.log_msg.emit(m)
+            )
+            rip_data = compiler.compile(self.image)
+
+            if self._cancel:
+                self.finished.emit(False, "已取消")
+                return
+
+            self.log_msg.emit(f"RIP 完成: {len(rip_data):,} bytes")
+            self.progress.emit(70, "RIP 完成，準備傳輸...")
+
+            # ── Phase 2: USB transfer (70–100%) ──────────────────────────
+            self.log_msg.emit("── 傳輸至印表機 ──")
+
+            def usb_progress(pct, msg):
+                mapped = 70 + int(pct * 0.30)
+                self.progress.emit(mapped, msg)
+
+            ok = self.printer.send_data(rip_data, progress_cb=usb_progress)
+
+            if ok:
+                self.progress.emit(100, "列印完成")
+                self.finished.emit(True, "列印工作已送出")
+            else:
+                self.finished.emit(False, "USB 傳輸失敗")
+
         except Exception as e:
-            self.error.emit(str(e))
-
-
-class USBWorker(QThread):
-    progress = pyqtSignal(int, str)
-    log_msg  = pyqtSignal(str)
-    finished = pyqtSignal(bool)
-
-    def __init__(self, printer, data):
-        super().__init__()
-        self.printer = printer
-        self.data    = data
-
-    def run(self):
-        ok = self.printer.send_data(self.data,
-                                    progress_cb=lambda p,m: self.progress.emit(p,m))
-        self.finished.emit(ok)
+            self.finished.emit(False, str(e))
 
 
 # ── Style ──────────────────────────────────────────────────────────────────
 
 STYLE = """
 * { font-family: 'Segoe UI', Arial, sans-serif; font-size: 12px; }
+QMainWindow, QWidget { background: #1E1E22; color: #CCCCCC; }
 
-QMainWindow { background: #2B2B2E; }
-
-/* Menu Bar */
 QMenuBar {
-    background: #1E1E21;
-    color: #CCCCCC;
-    border-bottom: 1px solid #3A3A3E;
-    padding: 2px 4px;
+    background: #141416; color: #BBBBBB;
+    border-bottom: 1px solid #2A2A2E; padding: 1px 4px;
 }
-QMenuBar::item { padding: 4px 10px; border-radius: 4px; }
-QMenuBar::item:selected { background: #3A3A40; color: #FFFFFF; }
+QMenuBar::item { padding: 4px 10px; border-radius: 3px; }
+QMenuBar::item:selected { background: #2A2A30; color: #FFF; }
 QMenu {
-    background: #252528; color: #CCCCCC;
-    border: 1px solid #3A3A3E;
+    background: #1E1E22; color: #CCCCCC;
+    border: 1px solid #333338; padding: 4px 0;
 }
-QMenu::item { padding: 6px 24px 6px 12px; }
-QMenu::item:selected { background: #0A84FF; color: #FFFFFF; }
-QMenu::separator { height: 1px; background: #3A3A3E; margin: 3px 0; }
+QMenu::item { padding: 6px 28px 6px 14px; }
+QMenu::item:selected { background: #0A84FF; color: #FFF; }
+QMenu::separator { height: 1px; background: #2A2A2E; margin: 3px 8px; }
 
-/* Toolbar */
 QToolBar {
-    background: #252528;
-    border-bottom: 1px solid #3A3A3E;
-    spacing: 4px;
-    padding: 4px 8px;
+    background: #181820; border-bottom: 1px solid #2A2A2E;
+    spacing: 3px; padding: 4px 8px;
 }
-QToolBar QToolButton {
-    background: transparent; border: none;
-    color: #AAAAAA; padding: 5px 10px;
-    border-radius: 5px; font-size: 11px;
-}
-QToolBar QToolButton:hover { background: #3A3A3E; color: #FFFFFF; }
-QToolBar QToolButton:pressed { background: #0A84FF; color: #FFFFFF; }
-QToolBar::separator { background: #3A3A3E; width: 1px; margin: 4px 6px; }
+QToolBar::separator { background: #2A2A2E; width: 1px; margin: 3px 5px; }
 
-/* Panels */
 QGroupBox {
-    border: 1px solid #3A3A3E; border-radius: 6px;
+    border: 1px solid #2E2E34; border-radius: 6px;
     margin-top: 14px; padding: 10px 8px 8px 8px;
-    background: #252528; color: #AAAAAA;
+    background: #1A1A1E;
 }
 QGroupBox::title {
     subcontrol-origin: margin; left: 10px; top: -1px;
-    padding: 0 5px; font-size: 10px;
-    letter-spacing: 1px; text-transform: uppercase;
-    color: #666670; background: #2B2B2E;
+    padding: 0 5px; font-size: 10px; letter-spacing: 1px;
+    color: #444450; background: #1E1E22;
 }
 
-/* Buttons */
 QPushButton {
-    background: #333338; color: #CCCCCC;
-    border: 1px solid #454548; border-radius: 5px;
-    padding: 6px 14px;
+    background: #2A2A30; color: #CCCCCC;
+    border: 1px solid #3A3A40; border-radius: 5px;
+    padding: 5px 13px;
 }
-QPushButton:hover  { background: #3E3E44; border-color: #555560; }
-QPushButton:pressed { background: #222226; }
-QPushButton:disabled { color: #555558; border-color: #333336; }
+QPushButton:hover  { background: #34343C; border-color: #4A4A52; }
+QPushButton:pressed { background: #1E1E24; }
+QPushButton:disabled { color: #44444A; border-color: #2A2A2E; }
 
-QPushButton#btn_print {
-    background: #0A84FF; color: #FFF; border: none;
-    font-weight: 600; font-size: 13px;
-    padding: 8px 22px; border-radius: 6px;
-}
-QPushButton#btn_print:hover   { background: #1A8EFF; }
-QPushButton#btn_print:disabled { background: #0A3A6A; color: #336699; }
-
-QPushButton#btn_rip {
-    background: #1E4A1E; color: #5CC85C; border: 1px solid #2E6A2E;
-    font-weight: 600; padding: 8px 22px; border-radius: 6px;
-}
-QPushButton#btn_rip:hover   { background: #245A24; }
-QPushButton#btn_rip:disabled { color: #2E502E; border-color: #1E301E; }
-
-/* Sliders */
 QSlider::groove:horizontal {
-    height: 4px; background: #3A3A3E; border-radius: 2px;
+    height: 4px; background: #2A2A30; border-radius: 2px;
 }
 QSlider::handle:horizontal {
     background: #0A84FF; border: none;
@@ -156,248 +137,206 @@ QSlider::handle:horizontal {
 }
 QSlider::sub-page:horizontal { background: #0A84FF; border-radius: 2px; }
 
-/* Combos */
 QComboBox {
-    background: #333338; border: 1px solid #454548;
+    background: #252528; border: 1px solid #353538;
     border-radius: 5px; padding: 4px 8px; color: #CCCCCC;
 }
 QComboBox::drop-down { border: none; width: 18px; }
 QComboBox QAbstractItemView {
-    background: #2A2A2E; border: 1px solid #454548;
+    background: #1E1E22; border: 1px solid #353538;
     selection-background-color: #0A84FF; color: #CCCCCC;
 }
 
-/* SpinBox */
 QSpinBox {
-    background: #333338; border: 1px solid #454548;
+    background: #252528; border: 1px solid #353538;
     border-radius: 5px; padding: 4px 6px; color: #CCCCCC;
 }
-
-/* CheckBox */
 QCheckBox { color: #AAAAAA; spacing: 6px; }
 QCheckBox::indicator {
     width: 15px; height: 15px; border-radius: 3px;
-    border: 1px solid #454548; background: #333338;
+    border: 1px solid #3A3A40; background: #252528;
 }
 QCheckBox::indicator:checked { background: #0A84FF; border-color: #0A84FF; }
 
-/* Progress */
 QProgressBar {
-    background: #333338; border: none; border-radius: 3px;
-    height: 6px; text-align: center; color: transparent;
+    background: #252528; border: none; border-radius: 3px;
+    height: 5px; text-align: center; color: transparent;
 }
 QProgressBar::chunk { background: #0A84FF; border-radius: 3px; }
 
-/* Log */
 QTextEdit {
-    background: #0D0D0F; border: 1px solid #2A2A2E;
-    border-radius: 5px; color: #00DD77;
-    font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 11px;
+    background: #0C0C0E; border: 1px solid #222226;
+    border-radius: 5px; color: #00CC66;
+    font-family: 'Cascadia Code','Consolas',monospace; font-size: 11px;
     padding: 6px;
 }
 
-/* List */
 QListWidget {
-    background: #1E1E22; border: none;
+    background: #141416; border: none;
     color: #CCCCCC; outline: none;
 }
-QListWidget::item {
-    padding: 8px 10px; border-bottom: 1px solid #2A2A2E;
-}
-QListWidget::item:selected {
-    background: #0A2A50; color: #FFFFFF; border-left: 3px solid #0A84FF;
-}
-QListWidget::item:hover { background: #2A2A30; }
+QListWidget::item { padding: 8px 10px; border-bottom: 1px solid #1E1E22; }
+QListWidget::item:selected { background: #0A1E38; border-left: 2px solid #0A84FF; }
+QListWidget::item:hover:!selected { background: #1E1E24; }
 
-/* Tabs */
-QTabWidget::pane { border: 1px solid #3A3A3E; background: #252528; }
+QTabWidget::pane { border: 1px solid #2A2A2E; background: #1A1A1E; }
 QTabBar::tab {
-    background: #1E1E22; color: #777780;
-    padding: 7px 14px; border: 1px solid #3A3A3E;
+    background: #141416; color: #666670;
+    padding: 6px 14px; border: 1px solid #2A2A2E;
     border-bottom: none; border-radius: 5px 5px 0 0; margin-right: 2px;
 }
-QTabBar::tab:selected { background: #252528; color: #EEEEEE; }
+QTabBar::tab:selected { background: #1A1A1E; color: #EEEEEE; }
 
-/* Status Bar */
-QStatusBar { background: #131315; color: #555560; font-size: 11px; border-top: 1px solid #2A2A2E; }
-
-/* Splitter */
-QSplitter::handle { background: #3A3A3E; }
-QSplitter::handle:horizontal { width: 1px; }
-QSplitter::handle:vertical { height: 1px; }
-
-/* Radio */
-QRadioButton { color: #AAAAAA; spacing: 6px; }
-QRadioButton::indicator {
-    width: 14px; height: 14px; border-radius: 7px;
-    border: 1px solid #454548; background: #333338;
+QStatusBar {
+    background: #0E0E10; color: #44444A;
+    font-size: 11px; border-top: 1px solid #1A1A1E;
 }
-QRadioButton::indicator:checked { background: #0A84FF; border-color: #0A84FF; }
-
-/* Label */
 QLabel { color: #AAAAAA; }
-QLabel#title_label { color: #EEEEEE; font-size: 13px; font-weight: 600; }
-QLabel#sub_label   { color: #666670; font-size: 10px; }
-
-/* Drop zone */
-QLabel#drop_zone {
-    color: #444450; border: 2px dashed #3A3A3E;
-    border-radius: 10px; background: #1A1A1E;
-}
-QLabel#drop_zone[drag=true] {
-    border-color: #0A84FF; background: #0A1A2A; color: #0A84FF;
-}
 """
 
 
-# ── Job Queue Item ─────────────────────────────────────────────────────────
+# ── Job item ───────────────────────────────────────────────────────────────
 
 class JobItem:
     def __init__(self, path: str, image: Image.Image):
-        self.path   = path
-        self.image  = image
-        self.name   = Path(path).name
-        self.size   = f"{image.width}×{image.height}"
-        self.mode_str = "CMYK+W"
-        self.rip_data = None
-        self.status   = "待處理"
+        self.path  = path
+        self.image = image
+        self.name  = Path(path).name
+        self.w, self.h = image.size
+        self.status = "待處理"
 
 
-# ── Preview Widget (drag-and-drop capable) ─────────────────────────────────
+# ── Drop-capable preview ───────────────────────────────────────────────────
 
 class PreviewWidget(QLabel):
-    image_dropped = pyqtSignal(str)
+    file_dropped = pyqtSignal(str)
+    clicked      = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self.setObjectName("drop_zone")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(400, 340)
+        self.setMinimumSize(360, 280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setAcceptDrops(True)
-        self._pil_image = None
-        self._view_mode  = "color"   # "color" | "white"
+        self._img: Image.Image | None = None
+        self._mode = "color"
         self._show_empty()
 
     def _show_empty(self):
-        self.setProperty("drag", False)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.setText("拖曳影像至此處\n或點擊「開啟影像」\n\n支援 PNG · TIFF · JPG · BMP")
+        self.setStyleSheet("""
+            background:#0F0F12;
+            border:2px dashed #2A2A30;
+            border-radius:10px;
+            color:#2E2E36;
+        """)
+        self.setText("拖曳影像至此處\n或點擊以開啟\n\nPNG · TIFF · JPG · BMP")
         self.setPixmap(QPixmap())
 
-    def load_image(self, img: Image.Image):
-        self._pil_image = img
-        self._refresh()
+    def load(self, img: Image.Image):
+        self._img = img
+        self._draw()
 
-    def set_view_mode(self, mode: str):
-        self._view_mode = mode
-        if self._pil_image:
-            self._refresh()
+    def set_mode(self, mode: str):
+        self._mode = mode
+        if self._img:
+            self._draw()
 
-    def _refresh(self):
-        if not self._pil_image:
+    def _draw(self):
+        if not self._img:
             return
-        img = self._pil_image.convert("RGBA")
-        w, h = img.size
+        import numpy as np
+        rgba = self._img.convert("RGBA")
+        w, h = rgba.size
+        arr  = np.array(rgba).astype(np.float32)
 
-        # Choose background
-        if self._view_mode == "white":
-            bg_color = (30, 30, 34, 255)       # dark bg — shows white ink
-        elif self._view_mode == "black":
-            bg_color = (0, 0, 0, 255)
-        else:
-            bg_color = None                     # checkerboard for transparency
-
-        canvas = Image.new("RGBA", (w, h), (255,255,255,255))
-        if bg_color is None:
-            # Draw checkerboard
-            tile = max(8, min(w, h) // 32)
+        if self._mode == "color":
+            # Checkerboard background to show transparency
+            tile = max(10, min(w, h) // 28)
+            bg = np.zeros((h, w, 4), dtype=np.float32)
             for y in range(0, h, tile):
                 for x in range(0, w, tile):
-                    c = (200,200,200,255) if (x//tile + y//tile)%2==0 else (160,160,160,255)
-                    for py in range(y, min(y+tile, h)):
-                        for px in range(x, min(x+tile, w)):
-                            canvas.putpixel((px,py), c)
-        else:
-            canvas = Image.new("RGBA", (w, h), bg_color)
+                    c = 200 if (x // tile + y // tile) % 2 == 0 else 155
+                    bg[y:y+tile, x:x+tile] = [c, c, c, 255]
+            a = arr[:, :, 3:4] / 255.0
+            composite = arr * a + bg * (1 - a)
+            out = composite.clip(0, 255).astype(np.uint8)
 
-        # Composite image onto background
-        canvas.paste(img, mask=img.split()[3])
+        elif self._mode == "white":
+            # Show alpha channel as white layer on dark bg
+            alpha = arr[:, :, 3]
+            out = np.zeros((h, w, 4), dtype=np.uint8)
+            out[:, :, 0] = alpha
+            out[:, :, 1] = alpha
+            out[:, :, 2] = alpha
+            out[:, :, 3] = 255
 
-        # If white-ink view: show alpha channel as white layer
-        if self._view_mode == "white":
-            import numpy as np
-            arr = np.array(self._pil_image.convert("RGBA"))
-            alpha = arr[:,:,3]
-            white_layer = Image.fromarray(alpha, mode='L').convert("RGBA")
-            white_arr = np.array(white_layer)
-            white_arr[:,:,0] = 255
-            white_arr[:,:,1] = 255
-            white_arr[:,:,2] = 255
-            canvas = Image.fromarray(white_arr)
+        else:  # black
+            bg = np.zeros((h, w, 4), dtype=np.float32)
+            bg[:, :, 3] = 255
+            a = arr[:, :, 3:4] / 255.0
+            composite = arr * a + bg * (1 - a)
+            out = composite.clip(0, 255).astype(np.uint8)
 
-        # Scale to widget size
-        aw, ah = self.width() - 20, self.height() - 20
-        if aw > 0 and ah > 0:
-            canvas.thumbnail((aw, ah), Image.LANCZOS)
+        # Scale to widget
+        canvas = Image.fromarray(out, "RGBA")
+        aw = max(100, self.width() - 20)
+        ah = max(80,  self.height() - 20)
+        canvas.thumbnail((aw, ah), Image.LANCZOS)
 
         data = canvas.tobytes("raw", "RGBA")
-        qimg = QImage(data, canvas.width, canvas.height, QImage.Format.Format_RGBA8888)
-        self.setPixmap(QPixmap.fromImage(qimg))
+        qi = QImage(data, canvas.width, canvas.height,
+                    QImage.Format.Format_RGBA8888)
+        self.setPixmap(QPixmap.fromImage(qi))
         self.setText("")
+        self.setStyleSheet("""
+            background:#0F0F12;
+            border:1px solid #252528;
+            border-radius:8px;
+        """)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        if self._pil_image:
-            QTimer.singleShot(50, self._refresh)
+        if self._img:
+            QTimer.singleShot(60, self._draw)
 
-    # ── Drag & Drop ──
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
     def dragEnterEvent(self, e: QDragEnterEvent):
         if e.mimeData().hasUrls():
-            urls = e.mimeData().urls()
             exts = {'.png','.jpg','.jpeg','.tif','.tiff','.bmp'}
-            if any(Path(u.toLocalFile()).suffix.lower() in exts for u in urls):
+            if any(Path(u.toLocalFile()).suffix.lower() in exts
+                   for u in e.mimeData().urls()):
                 e.acceptProposedAction()
-                self.setProperty("drag", True)
-                self.style().unpolish(self)
-                self.style().polish(self)
-                self.setText("放開以載入影像")
+                self.setStyleSheet("""
+                    background:#0A1A2A;
+                    border:2px dashed #0A84FF;
+                    border-radius:10px; color:#0A84FF;
+                """)
+                self.setText("放開以載入")
                 return
         e.ignore()
 
     def dragLeaveEvent(self, e):
-        if not self._pil_image:
-            self._show_empty()
-        else:
-            self._refresh()
+        if self._img: self._draw()
+        else: self._show_empty()
 
     def dropEvent(self, e: QDropEvent):
-        self.setProperty("drag", False)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        for url in e.mimeData().urls():
-            path = url.toLocalFile()
-            exts = {'.png','.jpg','.jpeg','.tif','.tiff','.bmp'}
-            if Path(path).suffix.lower() in exts:
-                self.image_dropped.emit(path)
-                break
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and not self._pil_image:
-            self.image_dropped.emit("")  # trigger open dialog
+        for u in e.mimeData().urls():
+            p = u.toLocalFile()
+            if Path(p).suffix.lower() in {'.png','.jpg','.jpeg','.tif','.tiff','.bmp'}:
+                self.file_dropped.emit(p)
+                return
 
 
-# ── Channel Bar ────────────────────────────────────────────────────────────
+# ── Channel indicator (compact, right-panel only) ─────────────────────────
 
-class ChannelBar(QWidget):
+class ChannelIndicator(QWidget):
     CHANNELS = [
-        ('C',  '#00B4D8', 'Cyan',   'CH0'),
-        ('M',  '#E040FB', 'Magenta','CH1'),
-        ('Y',  '#FFD600', 'Yellow', 'CH2'),
-        ('K',  '#607D8B', 'Black',  'CH3'),
-        ('W1', '#B0C4CE', 'White 1','CH4'),
-        ('W2', '#CFD8DC', 'White 2','CH5'),
+        ('C',  '#00B4D8'), ('M',  '#E040FB'),
+        ('Y',  '#FFD600'), ('K',  '#607D8B'),
+        ('W1', '#B0C4CE'), ('W2', '#CFD8DC'),
     ]
     ACTIVE = {
         PrintMode.CMYK_WHITE: {0,1,2,3,4,5},
@@ -408,48 +347,43 @@ class ChannelBar(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.mode = PrintMode.CMYK_WHITE
-        self.cards = []
+        self._mode = PrintMode.CMYK_WHITE
+        self.setFixedHeight(36)
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
-        lay.setSpacing(5)
-        for i,(sym,col,name,ch) in enumerate(self.CHANNELS):
-            f = QFrame()
-            f.setFixedSize(64, 72)
-            fl = QVBoxLayout(f)
-            fl.setContentsMargins(3,6,3,4)
-            fl.setSpacing(1)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self._dots = []
+        for sym, col in self.CHANNELS:
+            w = QWidget()
+            w.setFixedSize(30, 30)
+            wl = QVBoxLayout(w)
+            wl.setContentsMargins(0,0,0,0)
+            wl.setSpacing(1)
             dot = QLabel()
-            dot.setFixedSize(22,22)
-            dot.setStyleSheet(f"background:{col};border-radius:11px;border:1.5px solid rgba(255,255,255,0.15)")
+            dot.setFixedSize(14, 14)
             dot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lsym  = QLabel(sym);  lsym.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lname = QLabel(name); lname.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lch   = QLabel(ch);   lch.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lsym.setStyleSheet("font-weight:600;font-size:12px;color:#EEEEEE")
-            lname.setStyleSheet("font-size:8px;color:#666670")
-            lch.setStyleSheet("font-size:8px;color:#444450;font-family:monospace")
-            fl.addWidget(dot, alignment=Qt.AlignmentFlag.AlignHCenter)
-            fl.addWidget(lsym); fl.addWidget(lname); fl.addWidget(lch)
-            lay.addWidget(f)
-            self.cards.append((f, dot, lsym, col))
-        self._update()
+            lbl = QLabel(sym)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setStyleSheet("font-size:9px;font-weight:700")
+            wl.addWidget(dot, alignment=Qt.AlignmentFlag.AlignHCenter)
+            wl.addWidget(lbl)
+            lay.addWidget(w)
+            self._dots.append((dot, lbl, col))
+        self._refresh()
 
-    def set_mode(self, mode):
-        self.mode = mode
-        self._update()
+    def set_mode(self, m):
+        self._mode = m
+        self._refresh()
 
-    def _update(self):
-        active = self.ACTIVE.get(self.mode, set())
-        for i,(f,dot,lsym,col) in enumerate(self.cards):
+    def _refresh(self):
+        active = self.ACTIVE.get(self._mode, set())
+        for i, (dot, lbl, col) in enumerate(self._dots):
             if i in active:
-                f.setStyleSheet("QFrame{background:#1E2A1E;border:1px solid #2E5030;border-radius:7px}")
-                dot.setStyleSheet(f"background:{col};border-radius:11px;border:1.5px solid rgba(255,255,255,0.2)")
-                lsym.setStyleSheet("font-weight:600;font-size:12px;color:#EEEEEE")
+                dot.setStyleSheet(f"background:{col};border-radius:7px;border:1px solid rgba(255,255,255,0.15)")
+                lbl.setStyleSheet("font-size:9px;font-weight:700;color:#CCCCCC")
             else:
-                f.setStyleSheet("QFrame{background:#1A1A1C;border:1px solid #222226;border-radius:7px}")
-                dot.setStyleSheet(f"background:{col};border-radius:11px;opacity:0.2;border:1px solid #333")
-                lsym.setStyleSheet("font-weight:600;font-size:12px;color:#333336")
+                dot.setStyleSheet(f"background:{col};border-radius:7px;opacity:0.15")
+                lbl.setStyleSheet("font-size:9px;font-weight:700;color:#333338")
 
 
 # ── Main Window ────────────────────────────────────────────────────────────
@@ -458,297 +392,371 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("L805 DTF RIP Engine")
-        self.setMinimumSize(1100, 700)
-        self.resize(1280, 820)
+        self.setMinimumSize(1050, 660)
+        self.resize(1200, 780)
 
-        self._jobs: list[JobItem] = []
-        self._current_job: JobItem | None = None
-        self._rip_worker  = None
-        self._usb_worker  = None
-        self._rip_data    = None
+        self._jobs:    list[JobItem] = []
+        self._cur_job: JobItem | None = None
+        self._pipeline: PrintPipelineWorker | None = None
+        self._current_mode = PrintMode.CMYK_WHITE
+
         self.printer = L805Printer(
             log_cb=self._log,
             status_cb=self._on_printer_status
         )
-        self._current_mode = PrintMode.CMYK_WHITE
 
         self._build_menubar()
         self._build_toolbar()
         self._build_central()
         self._build_statusbar()
-
         self.setStyleSheet(STYLE)
-        self._update_actions()
-        QTimer.singleShot(600, self._connect_printer)
+        self._refresh_ui()
+        QTimer.singleShot(500, self._connect_printer)
 
-    # ── Menu Bar ───────────────────────────────────────────────────────────
+    # ── Menu bar ───────────────────────────────────────────────────────────
 
     def _build_menubar(self):
         mb = self.menuBar()
 
         # 檔案
         fm = mb.addMenu("檔案(&F)")
-        self._act_open  = fm.addAction("開啟影像(&O)…", self._open_image, QKeySequence("Ctrl+O"))
-        self._act_close = fm.addAction("移除目前工作(&W)", self._remove_job, QKeySequence("Ctrl+W"))
+        a = QAction("開啟影像(&O)…", self)
+        a.setShortcut(QKeySequence("Ctrl+O"))
+        a.triggered.connect(self._open_image)
+        fm.addAction(a)
+
+        a2 = QAction("移除目前工作(&W)", self)
+        a2.setShortcut(QKeySequence("Ctrl+W"))
+        a2.triggered.connect(self._remove_job)
+        fm.addAction(a2)
+
         fm.addSeparator()
-        self._act_save_rip = fm.addAction("儲存 ESC/P-R 資料…", self._save_rip)
+
+        a3 = QAction("儲存 ESC/P-R 資料…", self)
+        a3.triggered.connect(self._save_rip)
+        fm.addAction(a3)
+
         fm.addSeparator()
-        fm.addAction("結束(&X)", self.close, QKeySequence("Alt+F4"))
+
+        a4 = QAction("結束(&X)", self)
+        a4.setShortcut(QKeySequence("Alt+F4"))
+        a4.triggered.connect(self.close)
+        fm.addAction(a4)
 
         # 編輯
         em = mb.addMenu("編輯(&E)")
-        em.addAction("清除工作佇列", self._clear_queue)
-        em.addSeparator()
-        em.addAction("偏好設定…", lambda: QMessageBox.information(self,"設定","尚未開放"))
+        a5 = QAction("清除工作佇列", self)
+        a5.triggered.connect(self._clear_queue)
+        em.addAction(a5)
 
         # 語言
         lm = mb.addMenu("語言(&L)")
-        lm.addAction("繁體中文 ✓")
-        lm.addAction("English")
+        lm.addAction(QAction("繁體中文 ✓", self))
+        lm.addAction(QAction("English", self))
 
         # 檢視
         vm = mb.addMenu("檢視(&V)")
-        vm.addAction("彩色預覽", lambda: self._set_view("color"), QKeySequence("Ctrl+1"))
-        vm.addAction("白墨預覽", lambda: self._set_view("white"), QKeySequence("Ctrl+2"))
-        vm.addAction("黑底預覽", lambda: self._set_view("black"), QKeySequence("Ctrl+3"))
+        for label, mode, sc in [
+            ("彩色預覽", "color", "Ctrl+1"),
+            ("白墨預覽", "white", "Ctrl+2"),
+            ("黑底預覽", "black", "Ctrl+3"),
+        ]:
+            a = QAction(label, self)
+            a.setShortcut(QKeySequence(sc))
+            a.triggered.connect(lambda checked, m=mode: self._set_view(m))
+            vm.addAction(a)
+
         vm.addSeparator()
-        vm.addAction("日誌視窗", lambda: self._tabs.setCurrentIndex(3))
+        a6 = QAction("日誌", self)
+        a6.triggered.connect(lambda: self._tabs.setCurrentIndex(3))
+        vm.addAction(a6)
 
         # 說明
         hm = mb.addMenu("說明(&H)")
-        hm.addAction("WinUSB 驅動安裝指南", self._show_driver_help)
+        a7 = QAction("WinUSB 驅動安裝指南", self)
+        a7.triggered.connect(self._show_driver_help)
+        hm.addAction(a7)
         hm.addSeparator()
-        hm.addAction("關於 L805 DTF RIP", self._show_about)
+        a8 = QAction("關於", self)
+        a8.triggered.connect(self._show_about)
+        hm.addAction(a8)
 
     # ── Toolbar ────────────────────────────────────────────────────────────
 
     def _build_toolbar(self):
         tb = QToolBar("主工具列", self)
         tb.setMovable(False)
-        tb.setIconSize(QSize(16,16))
-        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        tb.setIconSize(QSize(14, 14))
         self.addToolBar(tb)
 
-        tb.addAction("📂  開啟影像", self._open_image)
+        def tbtn(label, slot, style=""):
+            btn = QPushButton(label)
+            btn.setFixedHeight(28)
+            btn.clicked.connect(slot)
+            if style:
+                btn.setStyleSheet(style)
+            tb.addWidget(btn)
+            return btn
+
+        tbtn("📂  開啟", self._open_image)
         tb.addSeparator()
 
-        self._tb_rip   = tb.addAction("▶  編譯 RIP",   self._start_rip)
-        self._tb_print = tb.addAction("🖨  傳送噴印",   self._start_print)
-        self._tb_cancel = tb.addAction("✕  取消",        self._cancel)
-        tb.addSeparator()
-
-        # View toggle buttons
-        lbl = QLabel("預覽:  ")
-        lbl.setStyleSheet("color:#777780;font-size:11px;padding:0 4px")
+        # View toggle group
+        lbl = QLabel("  預覽  ")
+        lbl.setStyleSheet("color:#3A3A42;font-size:11px")
         tb.addWidget(lbl)
 
+        self._vbtns = {}
         for label, mode in [("彩色","color"),("白墨","white"),("黑底","black")]:
             btn = QPushButton(label)
             btn.setCheckable(True)
-            btn.setFixedHeight(26)
+            btn.setFixedHeight(24)
             btn.setStyleSheet("""
-                QPushButton{background:#2A2A2E;border:1px solid #3A3A3E;
-                    color:#888890;padding:2px 10px;border-radius:4px;}
-                QPushButton:checked{background:#0A3A60;border-color:#0A84FF;color:#FFFFFF;}
-                QPushButton:hover{background:#353540;}
+                QPushButton{background:#222228;border:1px solid #2E2E34;
+                    color:#666670;padding:2px 10px;font-size:11px;
+                    border-radius:0}
+                QPushButton:first-child{border-radius:4px 0 0 4px}
+                QPushButton:checked{background:#0A2A4A;border-color:#0A84FF;color:#5ABAFF}
+                QPushButton:hover{background:#2A2A32}
             """)
-            btn.clicked.connect(lambda checked, m=mode: self._set_view(m))
-            if mode == "color":
-                btn.setChecked(True)
-                self._view_btn_color = btn
-            elif mode == "white":
-                self._view_btn_white = btn
-            else:
-                self._view_btn_black = btn
+            btn.clicked.connect(lambda _, m=mode: self._set_view(m))
             tb.addWidget(btn)
+            self._vbtns[mode] = btn
+        self._vbtns["color"].setChecked(True)
 
         tb.addSeparator()
-        self._printer_badge = QLabel("● 未連接")
-        self._printer_badge.setStyleSheet("color:#FF453A;font-size:11px;padding:0 8px")
-        tb.addWidget(self._printer_badge)
 
-        scan_btn = QPushButton("掃描印表機")
-        scan_btn.setFixedHeight(26)
-        scan_btn.setStyleSheet("""
-            QPushButton{background:#1E3A1E;border:1px solid #2E5A2E;
-                color:#5CC85C;padding:2px 10px;border-radius:4px;}
-            QPushButton:hover{background:#244422;}
-        """)
-        scan_btn.clicked.connect(self._connect_printer)
-        tb.addWidget(scan_btn)
+        # Printer status
+        self._tb_printer = QLabel("● 掃描中")
+        self._tb_printer.setStyleSheet("color:#888880;font-size:11px;padding:0 6px")
+        tb.addWidget(self._tb_printer)
 
-    # ── Central Layout ─────────────────────────────────────────────────────
+        tbtn("掃描印表機", self._connect_printer,
+             "QPushButton{background:#1A2A1A;color:#5CC85C;border:1px solid #2A4A2A;border-radius:4px;font-size:11px}")
+
+    # ── Central layout ─────────────────────────────────────────────────────
 
     def _build_central(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0,0,0,0)
+        cw = QWidget()
+        self.setCentralWidget(cw)
+        root = QHBoxLayout(cw)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Left: Job queue ──
+        # ── Left: job queue ──────────────────────────────────────────────
         left = QWidget()
-        left.setFixedWidth(210)
-        left.setStyleSheet("background:#1E1E22;border-right:1px solid #2A2A2E")
+        left.setFixedWidth(200)
+        left.setStyleSheet("background:#111114;border-right:1px solid #1E1E22")
         ll = QVBoxLayout(left)
-        ll.setContentsMargins(0,0,0,0)
+        ll.setContentsMargins(0, 0, 0, 0)
         ll.setSpacing(0)
 
-        queue_hdr = QLabel("  工作佇列")
-        queue_hdr.setFixedHeight(36)
-        queue_hdr.setStyleSheet("""
-            background:#161618;color:#666670;font-size:10px;
-            letter-spacing:1.5px;text-transform:uppercase;
-            border-bottom:1px solid #2A2A2E;padding-left:10px;
+        hdr = QLabel("  工作佇列")
+        hdr.setFixedHeight(32)
+        hdr.setStyleSheet("""
+            background:#0C0C0E;color:#3A3A42;font-size:9px;
+            letter-spacing:1.5px;border-bottom:1px solid #1A1A1E;
+            padding-left:10px;
         """)
-        ll.addWidget(queue_hdr)
+        ll.addWidget(hdr)
 
-        self._queue_list = QListWidget()
-        self._queue_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self._queue_list.itemClicked.connect(self._on_job_selected)
-        self._queue_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._queue_list.customContextMenuRequested.connect(self._queue_context_menu)
-        ll.addWidget(self._queue_list, 1)
+        self._queue = QListWidget()
+        self._queue.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._queue.itemClicked.connect(self._on_job_click)
+        self._queue.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._queue.customContextMenuRequested.connect(self._queue_ctx)
+        ll.addWidget(self._queue, 1)
 
-        add_btn = QPushButton("＋  加入影像")
-        add_btn.setFixedHeight(36)
-        add_btn.setStyleSheet("""
-            QPushButton{background:#1A2A1A;border:none;border-top:1px solid #2A3A2A;
-                color:#5CC85C;font-size:12px;}
-            QPushButton:hover{background:#1E341E;}
+        add = QPushButton("＋  加入影像")
+        add.setFixedHeight(34)
+        add.setStyleSheet("""
+            QPushButton{background:#141418;border:none;border-top:1px solid #1E1E22;
+                color:#5CC85C;font-size:11px;border-radius:0}
+            QPushButton:hover{background:#18221A}
         """)
-        add_btn.clicked.connect(self._open_image)
-        ll.addWidget(add_btn)
+        add.clicked.connect(self._open_image)
+        ll.addWidget(add)
 
         root.addWidget(left)
 
-        # ── Center: Preview ──
+        # ── Center: preview ───────────────────────────────────────────────
         mid = QWidget()
-        mid.setStyleSheet("background:#1A1A1D")
+        mid.setStyleSheet("background:#111116")
         ml = QVBoxLayout(mid)
-        ml.setContentsMargins(12,10,12,10)
-        ml.setSpacing(8)
+        ml.setContentsMargins(10, 8, 10, 8)
+        ml.setSpacing(6)
 
-        # Channel bar
-        ch_frame = QFrame()
-        ch_frame.setStyleSheet("background:#212125;border-radius:8px;padding:6px")
-        ch_lay = QVBoxLayout(ch_frame)
-        ch_lay.setContentsMargins(8,6,8,6)
-        ch_lay.setSpacing(4)
-        ch_lbl = QLabel("CHANNEL MAPPING")
-        ch_lbl.setStyleSheet("color:#444450;font-size:9px;letter-spacing:2px")
-        self.channel_bar = ChannelBar()
-        ch_lay.addWidget(ch_lbl)
-        ch_lay.addWidget(self.channel_bar)
-        ml.addWidget(ch_frame)
+        # Preview toolbar (view mode strip inside center panel)
+        ptb = QFrame()
+        ptb.setFixedHeight(32)
+        ptb.setStyleSheet("background:#161618;border-radius:6px")
+        ptbl = QHBoxLayout(ptb)
+        ptbl.setContentsMargins(8, 0, 8, 0)
+        ptbl.setSpacing(6)
+        ptbl.addWidget(QLabel("預覽:").also(
+            lambda l: l.setStyleSheet("color:#3A3A42;font-size:10px")) if False
+            else self._make_view_strip())
+        ml.addWidget(ptb)
 
-        # Preview
         self.preview = PreviewWidget()
-        self.preview.image_dropped.connect(self._on_image_dropped)
+        self.preview.file_dropped.connect(self._load_path)
+        self.preview.clicked.connect(self._open_image)
         ml.addWidget(self.preview, 1)
 
-        # Image info bar
-        self._img_info = QLabel("尚未載入影像")
-        self._img_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._img_info.setStyleSheet("color:#444450;font-size:10px;font-family:monospace;padding:2px")
-        ml.addWidget(self._img_info)
+        # Info bar
+        self._info = QLabel("尚未載入影像")
+        self._info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._info.setStyleSheet("color:#333338;font-size:10px;font-family:monospace")
+        ml.addWidget(self._info)
 
         # Progress
-        self._progress = QProgressBar()
-        self._progress.setRange(0,100)
-        self._progress.setFixedHeight(6)
-        self._progress.setVisible(False)
-        ml.addWidget(self._progress)
+        self._prog = QProgressBar()
+        self._prog.setRange(0, 100)
+        self._prog.setFixedHeight(5)
+        self._prog.setVisible(False)
+        ml.addWidget(self._prog)
 
-        self._progress_lbl = QLabel("")
-        self._progress_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._progress_lbl.setStyleSheet("color:#555560;font-size:10px;font-family:monospace")
-        self._progress_lbl.setVisible(False)
-        ml.addWidget(self._progress_lbl)
+        self._prog_lbl = QLabel("")
+        self._prog_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._prog_lbl.setStyleSheet("color:#444450;font-size:10px;font-family:monospace")
+        self._prog_lbl.setVisible(False)
+        ml.addWidget(self._prog_lbl)
 
-        # Action row
-        act_row = QHBoxLayout()
-        act_row.setSpacing(8)
+        # ── Action bar (bottom of center) ────────────────────────────────
+        ab = QFrame()
+        ab.setFixedHeight(54)
+        ab.setStyleSheet("background:#0E0E12;border-top:1px solid #1A1A1E;border-radius:0")
+        abl = QHBoxLayout(ab)
+        abl.setContentsMargins(12, 0, 12, 0)
+        abl.setSpacing(8)
 
         self._mode_lbl = QLabel("模式 1 · 彩色＋白墨")
-        self._mode_lbl.setStyleSheet("color:#555560;font-size:11px")
+        self._mode_lbl.setStyleSheet("color:#444450;font-size:11px")
+        abl.addWidget(self._mode_lbl)
+        abl.addStretch()
 
-        self._btn_rip   = QPushButton("▶  編譯 RIP")
-        self._btn_print = QPushButton("🖨  噴印")
-        self._btn_rip.setObjectName("btn_rip")
-        self._btn_print.setObjectName("btn_print")
-        self._btn_rip.setFixedHeight(38)
-        self._btn_print.setFixedHeight(38)
-        self._btn_rip.clicked.connect(self._start_rip)
-        self._btn_print.clicked.connect(self._start_print)
+        # Cancel (hidden by default)
+        self._btn_cancel = QPushButton("✕ 取消")
+        self._btn_cancel.setFixedHeight(36)
+        self._btn_cancel.setStyleSheet("""
+            QPushButton{background:#2A1A1A;color:#FF6060;
+                border:1px solid #4A2A2A;border-radius:5px;padding:0 14px}
+            QPushButton:hover{background:#341E1E}
+        """)
+        self._btn_cancel.setVisible(False)
+        self._btn_cancel.clicked.connect(self._cancel)
+        abl.addWidget(self._btn_cancel)
 
-        act_row.addWidget(self._mode_lbl)
-        act_row.addStretch()
-        act_row.addWidget(self._btn_rip)
-        act_row.addWidget(self._btn_print)
-        ml.addLayout(act_row)
+        # THE PRINT BUTTON — one click does everything
+        self._btn_print = QPushButton("  🖨  列印")
+        self._btn_print.setFixedHeight(40)
+        self._btn_print.setFixedWidth(130)
+        self._btn_print.setStyleSheet("""
+            QPushButton{
+                background:#0A84FF;color:#FFF;border:none;
+                font-size:14px;font-weight:700;border-radius:7px;
+                padding:0 18px;
+            }
+            QPushButton:hover{background:#1A8EFF}
+            QPushButton:pressed{background:#0070E0}
+            QPushButton:disabled{background:#0A3050;color:#225588}
+        """)
+        self._btn_print.clicked.connect(self._print)
+        abl.addWidget(self._btn_print)
 
+        ml.addWidget(ab)
         root.addWidget(mid, 1)
 
-        # ── Right: Settings ──
+        # ── Right: settings ───────────────────────────────────────────────
         right = QWidget()
-        right.setFixedWidth(260)
-        right.setStyleSheet("background:#222226;border-left:1px solid #2A2A2E")
+        right.setFixedWidth(248)
+        right.setStyleSheet("background:#161618;border-left:1px solid #1E1E22")
         rl = QVBoxLayout(right)
-        rl.setContentsMargins(10,10,10,10)
-        rl.setSpacing(10)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_mode_tab(),     "模式")
-        self._tabs.addTab(self._build_ink_tab(),      "墨水")
-        self._tabs.addTab(self._build_halftone_tab(), "加網")
-        self._tabs.addTab(self._build_log_tab(),      "日誌")
-        rl.addWidget(self._tabs, 1)
+        self._tabs.addTab(self._tab_mode(),     "模式")
+        self._tabs.addTab(self._tab_ink(),      "墨水")
+        self._tabs.addTab(self._tab_halftone(), "加網")
+        self._tabs.addTab(self._tab_log(),      "日誌")
+        rl.addWidget(self._tabs)
 
         root.addWidget(right)
 
-    # ── Right panel tabs ───────────────────────────────────────────────────
-
-    def _build_mode_tab(self):
+    def _make_view_strip(self):
+        """Returns a widget with the 3 view toggle buttons inline."""
         w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setSpacing(5)
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        lbl = QLabel("預覽模式  ")
+        lbl.setStyleSheet("color:#3A3A42;font-size:10px")
+        lay.addWidget(lbl)
+        for label, mode in [("彩色","color"),("白墨層","white"),("黑底","black")]:
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setFixedHeight(22)
+            btn.setStyleSheet("""
+                QPushButton{background:#1A1A1E;border:1px solid #2A2A2E;
+                    color:#555560;padding:1px 10px;font-size:11px;border-radius:0}
+                QPushButton:checked{background:#0A2040;border-color:#0A84FF;color:#4AABFF}
+                QPushButton:hover{background:#222228}
+            """)
+            btn.clicked.connect(lambda _, m=mode: self._set_view(m))
+            lay.addWidget(btn)
+            self._vbtns[mode] = btn
+        self._vbtns["color"].setChecked(True)
+        lay.addStretch()
+        return w
+
+    # ── Right-panel tabs ───────────────────────────────────────────────────
+
+    def _tab_mode(self):
+        w = QWidget(); lay = QVBoxLayout(w); lay.setSpacing(5)
 
         MODES = [
             (PrintMode.CMYK_WHITE, "模式 1", "彩色 ＋ 白墨",  "標準 DTF"),
             (PrintMode.WHITE_CMYK, "模式 2", "白墨 ＋ 彩色",  "燈箱/打樣"),
-            (PrintMode.CMYK_ONLY,  "模式 3", "僅彩色 CMYK",    "無白墨"),
-            (PrintMode.WHITE_ONLY, "模式 4", "僅白墨",          "單色矽膠"),
+            (PrintMode.CMYK_ONLY,  "模式 3", "僅彩色 CMYK",    "淺色膠片"),
+            (PrintMode.WHITE_ONLY, "模式 4", "僅白墨",          "矽膠單色"),
         ]
-        self._mode_frames = {}
+        self._mode_cards = {}
         for mode, num, title, sub in MODES:
             f = QFrame()
-            f.setFixedHeight(58)
-            f.setStyleSheet("""
-                QFrame{background:#2A2A2E;border:1px solid #383838;border-radius:7px}
-                QFrame:hover{border-color:#4A4A52}
-            """)
+            f.setFixedHeight(52)
             f.setCursor(Qt.CursorShape.PointingHandCursor)
-            fl = QVBoxLayout(f)
-            fl.setContentsMargins(10,6,10,6)
-            fl.setSpacing(1)
+            fl = QVBoxLayout(f); fl.setContentsMargins(10,5,10,5); fl.setSpacing(1)
             t = QLabel(f"{num} · {title}")
-            t.setStyleSheet("font-weight:600;font-size:12px;color:#CCCCCC")
+            t.setStyleSheet("font-weight:600;font-size:11px;color:#CCCCCC")
             s = QLabel(sub)
-            s.setStyleSheet("font-size:10px;color:#555560")
+            s.setStyleSheet("font-size:10px;color:#3A3A42")
             fl.addWidget(t); fl.addWidget(s)
             f.mousePressEvent = lambda e, m=mode: self._select_mode(m)
             f._mode = mode
             lay.addWidget(f)
-            self._mode_frames[mode] = f
+            self._mode_cards[mode] = f
+
+        # Channel indicator (compact, in settings panel)
+        sep = QFrame()
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background:#222228;margin:4px 0")
+        lay.addWidget(sep)
+
+        ch_lbl = QLabel("通道")
+        ch_lbl.setStyleSheet("color:#3A3A42;font-size:9px;letter-spacing:1px;margin-top:4px")
+        lay.addWidget(ch_lbl)
+
+        self._ch_indicator = ChannelIndicator()
+        lay.addWidget(self._ch_indicator)
 
         lay.addStretch()
 
-        # DPI
-        dpi_grp = QGroupBox("DPI")
-        dl = QVBoxLayout(dpi_grp)
+        # DPI / paper
+        dg = QGroupBox("輸出設定")
+        dl = QVBoxLayout(dg)
         self._dpi_combo = QComboBox()
-        self._dpi_combo.addItems(["1440 × 1440（標準）","5760 × 1440（最高）","720 × 720（草稿）"])
+        self._dpi_combo.addItems(["1440×1440（標準）","5760×1440（最高）","720×720（草稿）"])
         dl.addWidget(self._dpi_combo)
 
         row = QHBoxLayout()
@@ -758,115 +766,105 @@ class MainWindow(QMainWindow):
         self._pass_spin.setSuffix(" x")
         row.addWidget(self._pass_spin)
         dl.addLayout(row)
-        lay.addWidget(dpi_grp)
 
-        # Paper
-        paper_grp = QGroupBox("紙張")
-        pl = QVBoxLayout(paper_grp)
         self._paper_combo = QComboBox()
-        self._paper_combo.addItems(["A4  (210×297 mm)","A5  (148×210 mm)","A6  (105×148 mm)"])
-        pl.addWidget(self._paper_combo)
-        lay.addWidget(paper_grp)
+        self._paper_combo.addItems(["A4 (210×297mm)","A5 (148×210mm)","A6 (105×148mm)"])
+        dl.addWidget(self._paper_combo)
+        lay.addWidget(dg)
 
         self._select_mode(PrintMode.CMYK_WHITE)
         return w
 
-    def _build_ink_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
+    def _tab_ink(self):
+        w = QWidget(); lay = QVBoxLayout(w)
 
-        wg = QGroupBox("白墨 White Ink")
+        wg = QGroupBox("白墨  White Ink")
         wl = QGridLayout(wg)
 
+        def slider_row(label, min_, max_, val, cb):
+            wl_row = QHBoxLayout()
+            s = QSlider(Qt.Orientation.Horizontal)
+            s.setRange(min_, max_); s.setValue(val)
+            v = QLabel(cb(val))
+            v.setFixedWidth(34)
+            v.setStyleSheet("color:#EEEEEE;font-family:monospace;font-size:11px")
+            s.valueChanged.connect(lambda n: v.setText(cb(n)))
+            return s, v
+
         wl.addWidget(QLabel("濃度"), 0, 0)
-        self._white_slider = QSlider(Qt.Orientation.Horizontal)
-        self._white_slider.setRange(0,100); self._white_slider.setValue(90)
-        self._white_val = QLabel("90%"); self._white_val.setFixedWidth(36)
-        self._white_val.setStyleSheet("color:#EEEEEE;font-family:monospace;font-size:11px")
-        self._white_slider.valueChanged.connect(lambda v: self._white_val.setText(f"{v}%"))
-        wl.addWidget(self._white_slider,0,1); wl.addWidget(self._white_val,0,2)
+        self._white_s, self._white_v = slider_row("", 0, 100, 90, lambda v: f"{v}%")
+        wl.addWidget(self._white_s, 0, 1); wl.addWidget(self._white_v, 0, 2)
 
         wl.addWidget(QLabel("Alpha 閾值"), 1, 0)
-        self._alpha_slider = QSlider(Qt.Orientation.Horizontal)
-        self._alpha_slider.setRange(0,30); self._alpha_slider.setValue(5)
-        self._alpha_val = QLabel("5"); self._alpha_val.setFixedWidth(36)
-        self._alpha_val.setStyleSheet("color:#EEEEEE;font-family:monospace;font-size:11px")
-        self._alpha_slider.valueChanged.connect(lambda v: self._alpha_val.setText(str(v)))
-        wl.addWidget(self._alpha_slider,1,1); wl.addWidget(self._alpha_val,1,2)
+        self._alpha_s, self._alpha_v = slider_row("", 0, 30, 5, str)
+        wl.addWidget(self._alpha_s, 1, 1); wl.addWidget(self._alpha_v, 1, 2)
         lay.addWidget(wg)
 
-        cg = QGroupBox("Choke 收邊腐蝕")
+        cg = QGroupBox("Choke 收邊")
         cl = QVBoxLayout(cg)
-        self._choke_cb = QCheckBox("啟用  W_choked = W ⊖ K")
+        self._choke_cb = QCheckBox("啟用  W ⊖ K")
         self._choke_cb.setChecked(True)
         row = QHBoxLayout()
         row.addWidget(QLabel("收縮"))
         self._choke_spin = QSpinBox()
         self._choke_spin.setRange(1,5); self._choke_spin.setValue(2)
-        self._choke_spin.setSuffix(" px")
+        self._choke_spin.setSuffix(" px"); self._choke_spin.setFixedWidth(64)
         row.addWidget(self._choke_spin); row.addStretch()
         cl.addWidget(self._choke_cb); cl.addLayout(row)
         lay.addWidget(cg)
 
-        ig = QGroupBox("彩色墨量")
+        ig = QGroupBox("彩色墨量上限")
         il = QGridLayout(ig)
         il.addWidget(QLabel("上限"), 0, 0)
-        self._color_slider = QSlider(Qt.Orientation.Horizontal)
-        self._color_slider.setRange(50,100); self._color_slider.setValue(85)
-        self._color_val = QLabel("85%"); self._color_val.setFixedWidth(36)
-        self._color_val.setStyleSheet("color:#EEEEEE;font-family:monospace;font-size:11px")
-        self._color_slider.valueChanged.connect(lambda v: self._color_val.setText(f"{v}%"))
-        il.addWidget(self._color_slider,0,1); il.addWidget(self._color_val,0,2)
+        self._color_s, self._color_v = slider_row("", 50, 100, 85, lambda v: f"{v}%")
+        il.addWidget(self._color_s, 0, 1); il.addWidget(self._color_v, 0, 2)
         lay.addWidget(ig)
 
         lay.addStretch()
         return w
 
-    def _build_halftone_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-
-        info = QLabel(
-            "Floyd-Steinberg 誤差擴散\n"
-            "8-bit → 2-bit: 0/1.5/3.0/4.5 pl"
-        )
-        info.setStyleSheet("color:#555560;font-size:11px;line-height:1.7;padding:4px")
+    def _tab_halftone(self):
+        w = QWidget(); lay = QVBoxLayout(w)
+        info = QLabel("Floyd-Steinberg 誤差擴散\n8-bit → 2-bit: 0 / 1.5 / 3.0 / 4.5 pl")
+        info.setStyleSheet("color:#3A3A42;font-size:11px;line-height:1.7;padding:4px 0")
         lay.addWidget(info)
 
-        ag = QGroupBox("加網參數")
+        ag = QGroupBox("加網")
         al = QGridLayout(ag)
         al.addWidget(QLabel("擴散強度"), 0, 0)
-        self._diff_slider = QSlider(Qt.Orientation.Horizontal)
-        self._diff_slider.setRange(50,100); self._diff_slider.setValue(100)
-        self._diff_val = QLabel("100%"); self._diff_val.setFixedWidth(36)
-        self._diff_val.setStyleSheet("color:#EEEEEE;font-family:monospace;font-size:11px")
-        self._diff_slider.valueChanged.connect(lambda v: self._diff_val.setText(f"{v}%"))
-        al.addWidget(self._diff_slider,0,1); al.addWidget(self._diff_val,0,2)
+        self._diff_s = QSlider(Qt.Orientation.Horizontal)
+        self._diff_s.setRange(50,100); self._diff_s.setValue(100)
+        self._diff_v = QLabel("100%")
+        self._diff_v.setFixedWidth(34)
+        self._diff_v.setStyleSheet("color:#EEEEEE;font-family:monospace;font-size:11px")
+        self._diff_s.valueChanged.connect(lambda v: self._diff_v.setText(f"{v}%"))
+        al.addWidget(self._diff_s,0,1); al.addWidget(self._diff_v,0,2)
         lay.addWidget(ag)
 
-        dg = QGroupBox("VSDT 微滴")
+        dg = QGroupBox("VSDT 微滴對照")
         dl = QVBoxLayout(dg)
-        for code, name, size in [("00","不噴墨","0 pl"),("01","小墨滴","1.5 pl"),
-                                  ("10","中墨滴","3.0 pl"),("11","大墨滴★","4.5 pl")]:
+        for code, name, size, bg in [
+            ("00","不噴墨","0 pl","#1A1A1E"),
+            ("01","小墨滴","1.5 pl","#1A2030"),
+            ("10","中墨滴","3.0 pl","#1A2535"),
+            ("11","大墨滴★","4.5 pl","#0A1E34"),
+        ]:
             f = QFrame()
-            f.setStyleSheet("QFrame{background:#2A2A2E;border-radius:5px}")
+            f.setStyleSheet(f"QFrame{{background:{bg};border-radius:4px}}")
             fl = QHBoxLayout(f); fl.setContentsMargins(8,5,8,5)
-            c = QLabel(code)
-            c.setStyleSheet("font-family:monospace;font-size:13px;font-weight:700;color:#0A84FF;min-width:28px")
-            n = QLabel(f"{name}  {size}")
-            n.setStyleSheet("font-size:11px;color:#888890")
+            c = QLabel(code); c.setStyleSheet("font-family:monospace;font-size:13px;font-weight:700;color:#0A84FF;min-width:26px")
+            n = QLabel(f"{name}  {size}"); n.setStyleSheet("font-size:11px;color:#666670")
             fl.addWidget(c); fl.addWidget(n); fl.addStretch()
             dl.addWidget(f)
         lay.addWidget(dg)
         lay.addStretch()
         return w
 
-    def _build_log_tab(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
+    def _tab_log(self):
+        w = QWidget(); lay = QVBoxLayout(w)
         self._log_box = QTextEdit()
         self._log_box.setReadOnly(True)
-        self._log_box.setPlaceholderText("ESC/P-R 編譯日誌...")
+        self._log_box.setPlaceholderText("列印日誌...")
         lay.addWidget(self._log_box)
         row = QHBoxLayout()
         cb = QPushButton("清除"); cb.clicked.connect(self._log_box.clear)
@@ -878,261 +876,219 @@ class MainWindow(QMainWindow):
     # ── Status bar ─────────────────────────────────────────────────────────
 
     def _build_statusbar(self):
-        sb = QStatusBar()
-        self.setStatusBar(sb)
-        self._status_lbl = QLabel("待機中")
-        self._status_lbl.setStyleSheet("color:#555560")
-        sb.addWidget(self._status_lbl)
-        self._status_right = QLabel("L805 DTF RIP Engine v1.0")
-        self._status_right.setStyleSheet("color:#333338;margin-right:8px")
-        sb.addPermanentWidget(self._status_right)
+        sb = QStatusBar(); self.setStatusBar(sb)
+        self._sb_left  = QLabel("待機中")
+        self._sb_right = QLabel("L805 DTF RIP v1.0")
+        self._sb_right.setStyleSheet("color:#222228;margin-right:8px")
+        sb.addWidget(self._sb_left)
+        sb.addPermanentWidget(self._sb_right)
 
-    # ── Actions ────────────────────────────────────────────────────────────
+    # ── Core actions ───────────────────────────────────────────────────────
 
     def _select_mode(self, mode: PrintMode):
         self._current_mode = mode
-        for m, f in self._mode_frames.items():
+        for m, f in self._mode_cards.items():
             if m == mode:
-                f.setStyleSheet("QFrame{background:#0A2A50;border:1px solid #0A84FF;border-radius:7px}")
+                f.setStyleSheet("QFrame{background:#0A1E38;border:1px solid #0A5090;border-radius:6px}")
             else:
-                f.setStyleSheet("QFrame{background:#2A2A2E;border:1px solid #383838;border-radius:7px}QFrame:hover{border-color:#4A4A52}")
-        self.channel_bar.set_mode(mode)
+                f.setStyleSheet("QFrame{background:#1C1C20;border:1px solid #252528;border-radius:6px}QFrame:hover{border-color:#3A3A3E}")
+        self._ch_indicator.set_mode(mode)
         labels = {
             PrintMode.CMYK_WHITE: "模式 1 · 彩色＋白墨",
             PrintMode.WHITE_CMYK: "模式 2 · 白墨＋彩色",
             PrintMode.CMYK_ONLY:  "模式 3 · 僅彩色",
             PrintMode.WHITE_ONLY: "模式 4 · 僅白墨",
         }
-        self._mode_lbl.setText(labels.get(mode,""))
+        self._mode_lbl.setText(labels.get(mode, ""))
 
     def _set_view(self, mode: str):
-        self.preview.set_view_mode(mode)
-        for btn, m in [(self._view_btn_color,"color"),
-                       (self._view_btn_white,"white"),
-                       (self._view_btn_black,"black")]:
+        self.preview.set_mode(mode)
+        for m, btn in self._vbtns.items():
             btn.setChecked(m == mode)
-
-    def _on_image_dropped(self, path: str):
-        if not path:
-            self._open_image()
-            return
-        self._load_image_path(path)
 
     def _open_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "開啟影像", "",
-            "影像檔案 (*.png *.tif *.tiff *.bmp *.jpg *.jpeg)")
+            "影像 (*.png *.tif *.tiff *.bmp *.jpg *.jpeg)")
         if path:
-            self._load_image_path(path)
+            self._load_path(path)
 
-    def _load_image_path(self, path: str):
+    def _load_path(self, path: str):
         try:
             img = Image.open(path).convert("RGBA")
             job = JobItem(path, img)
             self._jobs.append(job)
-            item = QListWidgetItem(f"  {job.name}\n  {job.size}  {img.mode}")
-            item.setData(Qt.ItemDataRole.UserRole, len(self._jobs)-1)
-            self._queue_list.addItem(item)
-            self._queue_list.setCurrentItem(item)
-            self._select_job(job)
-            self._log(f"載入: {path}")
+
+            item = QListWidgetItem()
+            item.setText(f"  {job.name}\n  {job.w}×{job.h}")
+            item.setData(Qt.ItemDataRole.UserRole, len(self._jobs) - 1)
+            self._queue.addItem(item)
+            self._queue.setCurrentItem(item)
+            self._activate_job(job)
+            self._log(f"載入: {path}  ({job.w}×{job.h})")
         except Exception as e:
             QMessageBox.critical(self, "載入失敗", str(e))
 
-    def _on_job_selected(self, item: QListWidgetItem):
+    def _on_job_click(self, item: QListWidgetItem):
         idx = item.data(Qt.ItemDataRole.UserRole)
         if 0 <= idx < len(self._jobs):
-            self._select_job(self._jobs[idx])
+            self._activate_job(self._jobs[idx])
 
-    def _select_job(self, job: JobItem):
-        self._current_job = job
-        self.preview.load_image(job.image)
-        w,h = job.image.size
-        self._img_info.setText(f"{job.name}   {w}×{h} px   {job.image.mode}")
-        self._rip_data = job.rip_data
-        self._update_actions()
+    def _activate_job(self, job: JobItem):
+        self._cur_job = job
+        self.preview.load(job.image)
+        self._info.setText(f"{job.name}   {job.w}×{job.h} px   RGBA")
+        self.setWindowTitle(f"L805 DTF RIP Engine — [{job.name}]")
+        self._refresh_ui()
 
     def _remove_job(self):
-        row = self._queue_list.currentRow()
-        if row >= 0:
-            self._queue_list.takeItem(row)
-            if 0 <= row < len(self._jobs):
-                self._jobs.pop(row)
-            # Re-index
-            for i in range(self._queue_list.count()):
-                self._queue_list.item(i).setData(Qt.ItemDataRole.UserRole, i)
-            self._current_job = None
-            self._rip_data = None
-            self.preview._pil_image = None
-            self.preview._show_empty()
-            self._img_info.setText("尚未載入影像")
-            self._update_actions()
+        row = self._queue.currentRow()
+        if row < 0: return
+        self._queue.takeItem(row)
+        if 0 <= row < len(self._jobs):
+            self._jobs.pop(row)
+        for i in range(self._queue.count()):
+            self._queue.item(i).setData(Qt.ItemDataRole.UserRole, i)
+        self._cur_job = None
+        self.preview._img = None
+        self.preview._show_empty()
+        self._info.setText("尚未載入影像")
+        self.setWindowTitle("L805 DTF RIP Engine")
+        self._refresh_ui()
 
     def _clear_queue(self):
-        self._queue_list.clear()
-        self._jobs.clear()
-        self._current_job = None
-        self._rip_data = None
-        self.preview._pil_image = None
-        self.preview._show_empty()
-        self._img_info.setText("尚未載入影像")
-        self._update_actions()
+        self._queue.clear(); self._jobs.clear()
+        self._cur_job = None
+        self.preview._img = None; self.preview._show_empty()
+        self._info.setText("尚未載入影像")
+        self.setWindowTitle("L805 DTF RIP Engine")
+        self._refresh_ui()
 
-    def _queue_context_menu(self, pos: QPoint):
-        item = self._queue_list.itemAt(pos)
-        if not item:
-            return
+    def _queue_ctx(self, pos: QPoint):
+        item = self._queue.itemAt(pos)
+        if not item: return
         menu = QMenu(self)
-        menu.addAction("選取此工作", lambda: self._queue_list.setCurrentItem(item))
-        menu.addAction("移除", self._remove_job)
-        menu.exec(self._queue_list.mapToGlobal(pos))
+        a1 = QAction("選取", self); a1.triggered.connect(lambda: self._queue.setCurrentItem(item)); menu.addAction(a1)
+        a2 = QAction("移除", self); a2.triggered.connect(self._remove_job); menu.addAction(a2)
+        menu.exec(self._queue.mapToGlobal(pos))
 
     def _current_config(self) -> RIPConfig:
         dpi_map = {0: DPIMode.DPI_1440x1440, 1: DPIMode.DPI_5760x1440, 2: DPIMode.DPI_720x720}
         return RIPConfig(
             mode=self._current_mode,
             dpi=dpi_map.get(self._dpi_combo.currentIndex(), DPIMode.DPI_1440x1440),
-            white_density=self._white_slider.value()/100,
-            alpha_threshold=self._alpha_slider.value(),
-            color_ink_limit=self._color_slider.value()/100,
+            white_density=self._white_s.value() / 100,
+            alpha_threshold=self._alpha_s.value(),
+            color_ink_limit=self._color_s.value() / 100,
             choke_enabled=self._choke_cb.isChecked(),
             choke_pixels=self._choke_spin.value(),
             multipass=self._pass_spin.value(),
-            error_diffusion_strength=self._diff_slider.value()/100,
+            error_diffusion_strength=self._diff_s.value() / 100,
         )
 
-    def _update_actions(self):
-        has_img = self._current_job is not None
-        has_rip = self._rip_data is not None
-        self._btn_rip.setEnabled(has_img)
-        self._btn_print.setEnabled(has_rip)
-        self._tb_rip.setEnabled(has_img)
-        self._tb_print.setEnabled(has_rip)
+    # ── THE main action: one-click print ──────────────────────────────────
+    def _print(self):
+        if not self._cur_job:
+            return
+
+        self._btn_print.setEnabled(False)
+        self._btn_cancel.setVisible(True)
+        self._prog.setValue(0)
+        self._prog.setVisible(True)
+        self._prog_lbl.setVisible(True)
+        self._log(f"═══ 列印: {self._cur_job.name} ═══")
+
+        self._pipeline = PrintPipelineWorker(
+            self._cur_job.image,
+            self._current_config(),
+            self.printer
+        )
+        self._pipeline.progress.connect(self._on_progress)
+        self._pipeline.log_msg.connect(self._log)
+        self._pipeline.finished.connect(self._on_done)
+        self._pipeline.start()
+
+    def _cancel(self):
+        if self._pipeline and self._pipeline.isRunning():
+            self._pipeline.cancel()
+        self._log("⚠ 已取消")
+        self._reset_ui()
+
+    def _on_progress(self, pct: int, msg: str):
+        self._prog.setValue(pct)
+        self._prog_lbl.setText(msg)
+        self._sb_left.setText(msg)
+
+    def _on_done(self, ok: bool, msg: str):
+        self._reset_ui()
+        if ok:
+            self._log(f"✓ {msg}")
+            self._sb_left.setText(f"✓ {msg}")
+            QMessageBox.information(self, "列印完成", f"{self._cur_job.name if self._cur_job else ''}\n已成功送出至 Epson L805")
+        else:
+            self._log(f"✗ {msg}")
+            if msg != "已取消":
+                QMessageBox.warning(self, "列印失敗", msg)
+
+    def _reset_ui(self):
+        self._btn_print.setEnabled(self._cur_job is not None)
+        self._btn_cancel.setVisible(False)
+        self._prog.setVisible(False)
+        self._prog_lbl.setVisible(False)
+
+    def _refresh_ui(self):
+        has = self._cur_job is not None
+        self._btn_print.setEnabled(has)
+
+    # ── Printer ────────────────────────────────────────────────────────────
 
     def _connect_printer(self):
         self._log("掃描 USB 裝置...")
         self.printer.find_printer()
 
     def _on_printer_status(self, s: str):
-        colors = {PrinterStatus.READY:"#4CAF50",PrinterStatus.PRINTING:"#FF9800",
-                  PrinterStatus.ERROR:"#FF453A",PrinterStatus.DISCONNECTED:"#FF453A"}
-        col = colors.get(s,"#777780")
-        self._printer_badge.setText(f"● {s}")
-        self._printer_badge.setStyleSheet(f"color:{col};font-size:11px;padding:0 8px")
-        self._status_right.setText(f"印表機: {s}")
+        colors = {
+            PrinterStatus.READY:        "#4CAF50",
+            PrinterStatus.PRINTING:     "#FF9800",
+            PrinterStatus.ERROR:        "#FF5252",
+            PrinterStatus.DISCONNECTED: "#FF5252",
+        }
+        col = colors.get(s, "#888880")
+        self._tb_printer.setText(f"● {s}")
+        self._tb_printer.setStyleSheet(f"color:{col};font-size:11px;padding:0 6px")
+        self._sb_right.setText(f"印表機: {s}")
 
-    def _start_rip(self):
-        if not self._current_job:
-            return
-        self._btn_rip.setEnabled(False)
-        self._btn_print.setEnabled(False)
-        self._progress.setVisible(True)
-        self._progress_lbl.setVisible(True)
-        self._log("=== 開始 RIP 編譯 ===")
-        cfg = self._current_config()
-        self._rip_worker = RIPWorker(self._current_job.image, cfg)
-        self._rip_worker.progress.connect(self._on_progress)
-        self._rip_worker.log_msg.connect(self._log)
-        self._rip_worker.finished.connect(self._on_rip_done)
-        self._rip_worker.error.connect(self._on_rip_error)
-        self._rip_worker.start()
-
-    def _on_rip_done(self, data: bytes):
-        self._rip_data = data
-        if self._current_job:
-            self._current_job.rip_data = data
-        self._progress.setValue(100)
-        self._btn_rip.setEnabled(True)
-        self._btn_print.setEnabled(True)
-        self._progress.setVisible(False)
-        self._progress_lbl.setVisible(False)
-        self._log(f"=== RIP 完成: {len(data):,} bytes ===")
-        self._status_lbl.setText(f"RIP 完成 — {len(data)/1024:.1f} KB 就緒")
-
-    def _on_rip_error(self, err: str):
-        self._btn_rip.setEnabled(self._current_job is not None)
-        self._progress.setVisible(False)
-        self._progress_lbl.setVisible(False)
-        self._log(f"❌ {err}")
-        QMessageBox.critical(self, "RIP 失敗", err)
-
-    def _on_progress(self, pct: int, msg: str):
-        self._progress.setValue(pct)
-        self._progress_lbl.setText(msg)
-        self._status_lbl.setText(msg)
-
-    def _start_print(self):
-        if not self._rip_data:
-            return
-        self._btn_print.setEnabled(False)
-        self._btn_rip.setEnabled(False)
-        self._progress.setVisible(True)
-        self._progress_lbl.setVisible(True)
-        self._log("=== 開始傳輸至印表機 ===")
-        self._usb_worker = USBWorker(self.printer, self._rip_data)
-        self._usb_worker.progress.connect(self._on_progress)
-        self._usb_worker.log_msg.connect(self._log)
-        self._usb_worker.finished.connect(self._on_print_done)
-        self._usb_worker.start()
-
-    def _on_print_done(self, ok: bool):
-        self._btn_print.setEnabled(self._rip_data is not None)
-        self._btn_rip.setEnabled(self._current_job is not None)
-        self._progress.setVisible(False)
-        self._progress_lbl.setVisible(False)
-        if ok:
-            self._log("=== 噴印完成 ===")
-            QMessageBox.information(self, "完成", "已成功傳送至 Epson L805")
-        else:
-            self._log("❌ 噴印失敗")
-
-    def _cancel(self):
-        if self._rip_worker and self._rip_worker.isRunning():
-            self._rip_worker.terminate()
-        if self._usb_worker and self._usb_worker.isRunning():
-            self.printer.cancel()
-        self._progress.setVisible(False)
-        self._progress_lbl.setVisible(False)
-        self._update_actions()
-        self._log("⚠ 已取消")
+    # ── Log / Save ─────────────────────────────────────────────────────────
 
     def _log(self, msg: str):
-        import datetime
         ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self._log_box.append(f"[{ts}] {msg}")
         self._log_box.verticalScrollBar().setValue(
             self._log_box.verticalScrollBar().maximum())
 
     def _save_log(self):
-        p,_ = QFileDialog.getSaveFileName(self,"儲存日誌","rip_log.txt","文字 (*.txt)")
+        p, _ = QFileDialog.getSaveFileName(self, "儲存日誌", "log.txt", "文字 (*.txt)")
         if p:
-            with open(p,'w',encoding='utf-8') as f:
+            with open(p, 'w', encoding='utf-8') as f:
                 f.write(self._log_box.toPlainText())
 
     def _save_rip(self):
-        if not self._rip_data:
-            QMessageBox.warning(self,"無資料","請先執行 RIP 編譯")
-            return
-        p,_ = QFileDialog.getSaveFileName(self,"儲存 ESC/P-R","output.prn","PRN (*.prn);;All (*)")
-        if p:
-            with open(p,'wb') as f: f.write(self._rip_data)
-            self._log(f"已儲存: {p}")
+        QMessageBox.information(self, "提示", "請先列印一次，日誌中會顯示 ESC/P-R 資料大小。\n如需儲存原始資料，請在日誌 tab 中儲存。")
 
     def _show_driver_help(self):
-        QMessageBox.information(self,"WinUSB 驅動安裝",
+        QMessageBox.information(self, "WinUSB 驅動安裝",
             "1. 下載 Zadig: https://zadig.akeo.ie\n"
-            "2. 連接 L805 USB 並開機\n"
+            "2. L805 USB 連接電腦並開機\n"
             "3. Zadig → Options → List All Devices\n"
             "4. 選擇 EPSON L805\n"
             "5. Driver 選 WinUSB → Replace Driver\n"
             "6. 完成後重新掃描印表機")
 
     def _show_about(self):
-        QMessageBox.about(self,"關於 L805 DTF RIP Engine",
+        QMessageBox.about(self, "關於",
             "Epson L805 DTF RIP Engine v1.0\n\n"
-            "CMYKWW 六通道直通 WinUSB 噴印引擎\n"
-            "Floyd-Steinberg 誤差擴散 · VSDT 多階微滴\n"
-            "Morphological Choke · ESC/P-R 1440/5760 DPI\n\n"
+            "CMYKWW 六通道 · WinUSB 直通\n"
+            "Floyd-Steinberg · VSDT · ESC/P-R\n"
             "© 2026 DTF Studio")
 
 
