@@ -1093,8 +1093,7 @@ def main():
     app.setApplicationName("L805 DTF RIP Engine")
     app.setOrganizationName("DTF Studio")
 
-    # High DPI
-    app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+    # High DPI (AA_UseHighDpiPixmaps removed in PyQt6, handled automatically)
 
     win = MainWindow()
     win.show()
