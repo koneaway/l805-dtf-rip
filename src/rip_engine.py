@@ -297,6 +297,9 @@ class RIPCompiler:
         channels_to_print = channel_order
 
         for y in range(h):
+            # Check cancel flag every 10 lines
+            if y % 10 == 0 and getattr(self, '_cancelled', False):
+                raise InterruptedError("列印已取消")
             if y % 50 == 0:
                 pct = 65 + int(y / h * 25)
                 self._progress(pct, f"輸出掃描線 {y}/{h}...")
@@ -324,6 +327,9 @@ class RIPCompiler:
         self._progress(100, f"編譯完成 — {len(buf):,} bytes")
         self._log(f"ESC/P-R 串流大小: {len(buf):,} bytes ({len(buf)/1024:.1f} KB)")
         return bytes(buf)
+
+    def cancel(self):
+        self._cancelled = True
 
     def _get_channel_order(self) -> list:
         """Returns channel print order based on mode"""
